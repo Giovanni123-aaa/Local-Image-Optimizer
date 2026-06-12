@@ -1,0 +1,270 @@
+# -*- coding: utf-8 -*-
+"""
+图片批量压缩工具
+用法：python compress_images.py <输入目录> <输出目录> [选项]
+
+示例：
+  python compress_images.py ./photos ./output
+  python compress_images.py ./photos ./output --quality 85
+  python compress_images.py ./photos ./output --max-width 1920
+  python compress_images.py ./photos ./output --format jpeg
+  python compress_images.py ./photos ./output --png-mode keep
+"""
+
+import sys, io
+if sys.platform == "win32":
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
+
+import argparse, shutil, time
+from pathlib import Path
+from PIL import Image, ExifTags
+
+SUPPORTED_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff", ".tif"}
+FORMAT_MAP = {"jpeg": "JPEG", "jpg": "JPEG", "png": "PNG", "webp": "WEBP"}
+
+
+def fix_orientation(img):
+    try:
+        exif = img._getexif()
+        if not exif:
+            return img
+        key = next((k for k, v in ExifTags.TAGS.items() if v == "Orientation"), None)
+        if key and key in exif:
+            angle = {3: 180, 6: 270, 8: 90}.get(exif[key])
+            if angle:
+                img = img.rotate(angle, expand=True)
+    except Exception:
+        pass
+    return img
+
+
+def best_png_compression(img, dst_path, quality):
+    """
+    对 PNG 尝试三种方案，取最小的：
+      1. WebP 有损（通常最小）
+      2. PNG 量化 256色（保持 .png 扩展名）
+      3. 原始 PNG optimize
+    返回最终写入的路径和大小。
+    """
+    import tempfile, os
+
+    candidates = []
+
+    # 方案1：WebP
+    webp_path = dst_path.with_suffix(".webp")
+    try:
+        src = img.convert("RGB") if img.mode in ("RGBA", "LA") else img
+        # 如果有透明通道，WebP 支持 RGBA
+        save_img = img if img.mode == "RGBA" else img.convert("RGB")
+        save_img.save(webp_path, format="WEBP", quality=quality, method=6)
+        candidates.append((webp_path.stat().st_size, webp_path))
+    except Exception:
+        pass
+
+    # 方案2：PNG 量化（有损，类 pngquant）
+    quant_path = dst_path.with_suffix(".png")
+    try:
+        if img.mode == "RGBA":
+            # 保留 alpha，量化时转回 RGBA
+            q = img.quantize(colors=256, dither=Image.Dither.FLOYDSTEINBERG)
+            q = q.convert("RGBA")
+        else:
+            rgb = img.convert("RGB")
+            q = rgb.quantize(colors=256, dither=Image.Dither.FLOYDSTEINBERG)
+        q.save(quant_path, format="PNG", optimize=True, compress_level=9)
+        candidates.append((quant_path.stat().st_size, quant_path))
+    except Exception:
+        pass
+
+    # 方案3：PNG 无损 optimize（兜底）
+    lossless_path = dst_path.with_suffix(".png")
+    try:
+        src = img if img.mode in ("RGB","RGBA","L") else img.convert("RGB")
+        src.save(lossless_path, format="PNG", optimize=True, compress_level=9)
+        candidates.append((lossless_path.stat().st_size, lossless_path))
+    except Exception:
+        pass
+
+    if not candidates:
+        raise RuntimeError("所有 PNG 压缩方案均失败")
+
+    # 选最小的
+    best_size, best_path = min(candidates, key=lambda x: x[0])
+
+    # 删掉没被选中的其他文件（路径不同时）
+    for size, path in candidates:
+        if path != best_path and path.exists():
+            path.unlink()
+
+    # 如果最优是 quant_path 或 lossless_path（都是 .png），可能已经写了同一个文件，没事
+    return best_path, best_size
+
+
+def compress_image(src_path, dst_path, quality, max_width, max_height, output_format, png_mode):
+    """
+    压缩单张图片。
+    png_mode: "auto"（智能选最小）| "webp"（强制 webp）| "quantize"（有损量化 PNG）| "keep"（无损 PNG）
+    返回 (原始大小, 压缩后大小, 实际输出路径)
+    """
+    original_size = src_path.stat().st_size
+    src_ext = src_path.suffix.lower()
+
+    img = Image.open(src_path)
+    if hasattr(img, "_getexif"):
+        img = fix_orientation(img)
+
+    # 等比缩放
+    w, h = img.size
+    scale = 1.0
+    if max_width  and w > max_width:  scale = min(scale, max_width  / w)
+    if max_height and h > max_height: scale = min(scale, max_height / h)
+    if scale < 1.0:
+        img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+
+    dst_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # PNG 特殊处理
+    if src_ext == ".png" and output_format == "keep":
+        if png_mode == "auto":
+            out_path, comp_size = best_png_compression(img, dst_path, quality)
+            return original_size, comp_size, out_path
+        elif png_mode == "webp":
+            out_path = dst_path.with_suffix(".webp")
+            save_img = img if img.mode == "RGBA" else img.convert("RGB")
+            save_img.save(out_path, format="WEBP", quality=quality, method=6)
+            return original_size, out_path.stat().st_size, out_path
+        elif png_mode == "quantize":
+            out_path = dst_path.with_suffix(".png")
+            if img.mode == "RGBA":
+                q = img.quantize(colors=256, dither=Image.Dither.FLOYDSTEINBERG).convert("RGBA")
+            else:
+                q = img.convert("RGB").quantize(colors=256, dither=Image.Dither.FLOYDSTEINBERG)
+            q.save(out_path, format="PNG", optimize=True, compress_level=9)
+            return original_size, out_path.stat().st_size, out_path
+        else:  # keep
+            out_path = dst_path.with_suffix(".png")
+            src = img if img.mode in ("RGB","RGBA","L") else img.convert("RGB")
+            src.save(out_path, format="PNG", optimize=True, compress_level=9)
+            return original_size, out_path.stat().st_size, out_path
+
+    # 非 PNG 或指定了输出格式
+    if output_format == "keep":
+        fmt = "JPEG" if src_ext in (".jpg", ".jpeg") else src_ext.lstrip(".").upper()
+        fmt = FORMAT_MAP.get(fmt.lower(), fmt)
+        out_ext = src_ext
+    else:
+        fmt = FORMAT_MAP.get(output_format, "JPEG")
+        out_ext = ".jpg" if output_format in ("jpeg","jpg") else f".{output_format}"
+
+    if fmt == "JPEG" and img.mode in ("RGBA", "P", "LA"):
+        bg = Image.new("RGB", img.size, (255, 255, 255))
+        if img.mode == "P": img = img.convert("RGBA")
+        bg.paste(img, mask=img.split()[-1] if img.mode in ("RGBA","LA") else None)
+        img = bg
+    elif img.mode not in ("RGB","RGBA","L"):
+        img = img.convert("RGB")
+
+    out_path = dst_path.with_suffix(out_ext)
+    save_kwargs = {}
+    if fmt == "JPEG":
+        save_kwargs = {"quality": quality, "optimize": True, "progressive": True}
+    elif fmt == "WEBP":
+        save_kwargs = {"quality": quality, "method": 6}
+    elif fmt == "PNG":
+        save_kwargs = {"optimize": True, "compress_level": 9}
+
+    img.save(out_path, format=fmt, **save_kwargs)
+    return original_size, out_path.stat().st_size, out_path
+
+
+def fmt_size(n):
+    if n < 1024:     return f"{n} B"
+    if n < 1048576:  return f"{n/1024:.1f} KB"
+    return f"{n/1048576:.2f} MB"
+
+
+def main():
+    parser = argparse.ArgumentParser(description="批量压缩图片（智能处理 PNG）")
+    parser.add_argument("input_dir")
+    parser.add_argument("output_dir")
+    parser.add_argument("--quality",    "-q", type=int, default=85,
+                        help="压缩质量 1-100，默认 85")
+    parser.add_argument("--max-width",  type=int, default=None)
+    parser.add_argument("--max-height", type=int, default=None)
+    parser.add_argument("--format", "-f", default="keep",
+                        choices=["keep","jpeg","jpg","png","webp"],
+                        help="输出格式，默认 keep")
+    parser.add_argument("--png-mode", default="auto",
+                        choices=["auto","webp","quantize","keep"],
+                        help="PNG 压缩策略：auto=自动取最小（默认）| webp=转WebP | quantize=有损量化PNG | keep=无损PNG")
+    parser.add_argument("--recursive", "-r", action="store_true")
+    args = parser.parse_args()
+
+    input_dir  = Path(args.input_dir)
+    output_dir = Path(args.output_dir)
+
+    if not input_dir.exists():
+        print(f"[ERROR] 输入目录不存在: {input_dir}"); sys.exit(1)
+    if input_dir.resolve() == output_dir.resolve():
+        print("[ERROR] 输入和输出目录不能相同"); sys.exit(1)
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    pattern   = "**/*" if args.recursive else "*"
+    all_files = [p for p in input_dir.glob(pattern)
+                 if p.is_file() and p.suffix.lower() in SUPPORTED_EXTS]
+
+    if not all_files:
+        print(f"[WARN] 没有找到支持的图片: {input_dir}"); sys.exit(0)
+
+    print(f"\n[INFO] 找到 {len(all_files)} 张图片，开始压缩...\n")
+    print(f"       输入: {input_dir.resolve()}")
+    print(f"       输出: {output_dir.resolve()}")
+    print(f"       质量: {args.quality}  PNG策略: {args.png_mode}  格式: {args.format}\n")
+
+    total_orig = total_comp = success = skipped = failed = 0
+    start = time.time()
+
+    for src_path in sorted(all_files):
+        rel = src_path.relative_to(input_dir)
+        dst_path = output_dir / rel
+        try:
+            orig, comp, out_path = compress_image(
+                src_path, dst_path,
+                quality=args.quality,
+                max_width=args.max_width,
+                max_height=args.max_height,
+                output_format=args.format,
+                png_mode=args.png_mode,
+            )
+            if comp >= orig:
+                shutil.copy2(src_path, dst_path.with_suffix(src_path.suffix))
+                comp = orig
+                skipped += 1
+                tag = "(跳过，原图更小)"
+            else:
+                success += 1
+                ratio = (1 - comp / orig) * 100
+                fmt_note = f"-> {out_path.suffix}" if out_path.suffix != src_path.suffix else ""
+                tag = f"压缩 {ratio:.1f}% {fmt_note}"
+            total_orig += orig
+            total_comp += comp
+            print(f"  [OK] {str(rel):<50} {fmt_size(orig):>10} -> {fmt_size(comp):>10}  {tag}")
+        except Exception as e:
+            failed += 1
+            print(f"  [FAIL] {str(rel):<48} 失败: {e}")
+
+    elapsed = time.time() - start
+    overall = (1 - total_comp / total_orig) * 100 if total_orig else 0
+    print(f"""
+--------------------------------------------------
+  完成！耗时 {elapsed:.1f}s
+  成功: {success} 张  跳过: {skipped} 张  失败: {failed} 张
+  总计: {fmt_size(total_orig)} -> {fmt_size(total_comp)}  节省 {overall:.1f}%
+--------------------------------------------------
+""")
+
+
+if __name__ == "__main__":
+    main()
